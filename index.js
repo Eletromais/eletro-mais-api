@@ -91,7 +91,17 @@ function broadcast(data) {
     }
   });
 }
-
+// Rota para buscar alarmes por ID do dispositivo
+app.get('/api/alarms/:id', (req, res) => {
+  const { id } = req.params;
+  
+  // Exemplo de resposta (ajuste conforme a estrutura esperada pelo seu app)
+  res.json({
+    ok: true,
+    deviceId: id,
+    alarms: []
+  });
+});
 // 5. Rotas da API REST
 
 // Lista de equipamentos — o app espera um ARRAY, não um objeto
