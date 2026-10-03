@@ -23,7 +23,7 @@ const DATA_FILE = path.join(baseDir, 'devices.json');
 let db;
 try {
   db = new Database(dbPath);
-  console.log(Banco de dados SQLite carregado em: ${dbPath});
+  console.log('Banco de dados SQLite carregado em: ${dbPath}');
 } catch (error) {
   console.error('Erro ao inicializar o banco SQLite:', error);
 }
@@ -168,5 +168,5 @@ app.get('/', (req, res) => {
 
 // 6. Arranque do Servidor
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(Servidor rodando na porta ${PORT});
+  console.log('Servidor rodando na porta ${PORT}');
 });
