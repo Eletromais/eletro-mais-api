@@ -25,7 +25,7 @@ let db;
 
 try {
   db = new Database(dbPath);
-  console.log(Banco de dados SQLite carregado em: ${dbPath});
+  console.log('Banco de dados SQLite carregado em: ${dbPath}');
 } catch (error) {
   console.error('Erro ao inicializar o banco SQLite:', error);
 }
@@ -75,7 +75,7 @@ wss.on('connection', (ws) => {
   console.log('Novo cliente WebSocket conectado.');
 
   ws.on('message', (message) => {
-    console.log(Mensagem recebida via WS: ${message});
+    console.log('Mensagem recebida via WS: ${message}');
   });
 
   ws.on('close', () => {
@@ -181,5 +181,5 @@ app.get('/', (req, res) => {
 // 6. Inicialização do Servidor
 // Escutando em 0.0.0.0 para aceitar conexões do proxy Railway
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(Servidor rodando na porta ${PORT});
+  console.log('Servidor rodando na porta ${PORT}');
 });
