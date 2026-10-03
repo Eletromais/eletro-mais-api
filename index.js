@@ -237,7 +237,7 @@ app.post('/api/telemetry', (req, res) => {
     createAlarm(
       id,
       'HIGH_TEMPERATURE',
-      Temperatura elevada detetada no equipamento ${'existing.name || id}: ${temperature'}°C,
+      Temperatura elevada detetada no equipamento ${existing.name || id}: ${temperature}°C,
       'critical'
     );
   }
