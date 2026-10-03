@@ -65,7 +65,7 @@ wss.on('connection', (ws) => {
   console.log('Novo cliente WebSocket conectado.');
 
   ws.on('message', (message) => {
-    console.log(Mensagem recebida via WS: ${message});
+    console.log('Mensagem recebida via WS: ${message}');
   });
 
   ws.on('close', () => {
