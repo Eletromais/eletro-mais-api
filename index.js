@@ -20,12 +20,25 @@ if (!fs.existsSync(baseDir)) {
 const dbPath = path.join(baseDir, 'database.db');
 const DATA_FILE = path.join(baseDir, 'devices.json');
 
-// 2. Inicialização do Banco de Dados SQLite
+// 2. Inicialização do Banco de Dados SQLite e tabela de Alarmes
 let db;
 
 try {
   db = new Database(dbPath);
   console.log('Banco de dados SQLite carregado em: ${dbPath}');
+
+  // Tabela para histórico persistente de alarmes/notificações
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS alarms (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      deviceId TEXT NOT NULL,
+      type TEXT NOT NULL,
+      message TEXT NOT NULL,
+      severity TEXT DEFAULT 'warning',
+      resolved INTEGER DEFAULT 0,
+      timestamp TEXT NOT NULL
+    )
+  `);
 } catch (error) {
   console.error('Erro ao inicializar o banco SQLite:', error);
 }
@@ -61,6 +74,40 @@ function saveDevices() {
   }
 }
 
+// Auxiliar para registar alarmes no banco e notificar via WebSocket
+function createAlarm(deviceId, type, message, severity = 'warning') {
+  const timestamp = new Date().toISOString();
+  
+  if (db) {
+    try {
+      const stmt = db.prepare(`
+        INSERT INTO alarms (deviceId, type, message, severity, resolved, timestamp)
+        VALUES (?, ?, ?, ?, 0, ?)
+      `);
+      stmt.run(deviceId, type, message, severity, timestamp);
+    } catch (err) {
+      console.error('Erro ao guardar alarme no SQLite:', err);
+    }
+  }
+
+  const alarmPayload = {
+    deviceId,
+    type,
+    message,
+    severity,
+    resolved: false,
+    timestamp
+  };
+
+  // Dispara a notificação de alarme em tempo real
+  broadcast({
+    type: 'ALARM_NOTIFICATION',
+    data: alarmPayload
+  });
+
+  return alarmPayload;
+}
+
 // 4. Configuração do Servidor Express e WebSockets
 const app = express();
 
@@ -94,7 +141,30 @@ function broadcast(data) {
 
 // 5. Rotas da API REST
 
-// Lista de equipamentos — o app espera um ARRAY, não um objeto
+// Status do servidor e estatísticas do painel
+app.get('/api/summary', (req, res) => {
+  const deviceList = Object.values(devices);
+  let activeAlarmsCount = 0;
+
+  if (db) {
+    try {
+      const row = db.prepare('SELECT COUNT(*) as count FROM alarms WHERE resolved = 0').get();
+      activeAlarmsCount = row ? row.count : 0;
+    } catch (e) {
+      console.error('Erro ao ler resumo de alarmes:', e);
+    }
+  }
+
+  res.json({
+    ok: true,
+    clientsCount: 1,
+    equipmentsCount: deviceList.length,
+    onlineCount: deviceList.filter(d => d.online).length,
+    alarmsCount: activeAlarmsCount
+  });
+});
+
+// Lista de equipamentos — o app espera um ARRAY
 app.get('/api/devices', (req, res) => {
   res.json(Object.values(devices));
 });
@@ -148,7 +218,7 @@ app.post('/api/telemetry', (req, res) => {
     location: ''
   };
 
-  devices[id] = {
+  const updatedDevice = {
     ...existing,
     id,
     temperature: temperature ?? existing.temperature ?? 0,
@@ -159,17 +229,98 @@ app.post('/api/telemetry', (req, res) => {
     updatedAt: timestamp
   };
 
+  devices[id] = updatedDevice;
   saveDevices();
 
-  // Dispara evento via WebSocket em tempo real
+  // --- Regras de disparo de Alarmes/Notificações automáticas ---
+  if (temperature !== undefined && temperature > 10) {
+    createAlarm(
+      id,
+      'HIGH_TEMPERATURE',
+      Temperatura elevada detetada no equipamento ${existing.name || id}: ${temperature}°C,
+      'critical'
+    );
+  }
+
+  if (vibration !== undefined && vibration > 5) {
+    createAlarm(
+      id,
+      'HIGH_VIBRATION',
+      Nível de vibração anormal no equipamento ${existing.name || id}: ${vibration},
+      'warning'
+    );
+  }
+
+  // Dispara evento de telemetria via WebSocket em tempo real
   broadcast({
     type: 'telemetry',
-    data: devices[id]
+    data: updatedDevice
   });
 
   res.json({
     ok: true,
-    device: devices[id]
+    device: updatedDevice
+  });
+});
+
+// --- ROTAS DE ALARMES E NOTIFICAÇÕES ---
+
+// Obter todos os alarmes
+app.get('/api/alarms', (req, res) => {
+  if (!db) return res.json({ ok: true, alarms: [] });
+
+  try {
+    const alarms = db.prepare('SELECT * FROM alarms ORDER BY id DESC LIMIT 50').all();
+    res.json(alarms);
+  } catch (err) {
+    console.error('Erro ao procurar alarmes:', err);
+    res.status(500).json({ ok: false, message: 'Erro ao carregar alarmes.' });
+  }
+});
+
+// Obter alarmes específicos de um equipamento
+app.get('/api/alarms/:id', (req, res) => {
+  const { id } = req.params;
+  if (!db) return res.json({ ok: true, deviceId: id, alarms: [] });
+
+  try {
+    const alarms = db.prepare('SELECT * FROM alarms WHERE deviceId = ? ORDER BY id DESC').all(id);
+    res.json({
+      ok: true,
+      deviceId: id,
+      alarms
+    });
+  } catch (err) {
+    console.error('Erro ao procurar alarmes do dispositivo:', err);
+    res.status(500).json({ ok: false, message: 'Erro ao carregar alarmes do dispositivo.' });
+  }
+});
+
+// Marcar alarme como resolvido
+app.post('/api/alarms/:id/resolve', (req, res) => {
+  const { id } = req.params;
+
+  if (db) {
+    try {
+      db.prepare('UPDATE alarms SET resolved = 1 WHERE id = ?').run(id);
+    } catch (err) {
+      console.error('Erro ao resolver alarme:', err);
+    }
+  }
+
+  res.json({ ok: true, message: 'Alarme resolvido com sucesso.' });
+});
+
+// Rota de histórico por dispositivo
+app.get('/api/history/:id/summary', (req, res) => {
+  const { id } = req.params;
+  const { period } = req.query;
+
+  res.json({
+    ok: true,
+    deviceId: id,
+    period: period || '24h',
+    history: []
   });
 });
 
@@ -179,7 +330,6 @@ app.get('/', (req, res) => {
 });
 
 // 6. Inicialização do Servidor
-// Escutando em 0.0.0.0 para aceitar conexões do proxy Railway
 server.listen(PORT, '0.0.0.0', () => {
   console.log('Servidor rodando na porta ${PORT}');
 });
