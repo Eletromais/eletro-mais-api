@@ -6,7 +6,7 @@ const http = require('http');
 const WebSocket = require('ws');
 const Database = require('better-sqlite3');
 
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 8080;
 
 // 1. Definição do diretório seguro
 const baseDir = process.env.NODE_ENV === 'production' ? '/tmp' : __dirname;
