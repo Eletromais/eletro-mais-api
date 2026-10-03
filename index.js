@@ -6,37 +6,41 @@ const http = require('http');
 const WebSocket = require('ws');
 const Database = require('better-sqlite3');
 
+// A Railway injeta process.env.PORT. Fallback para 8080.
 const PORT = process.env.PORT || 8080;
 
-// 1. Definição do diretório seguro
+// 1. Definição e criação do diretório seguro para o banco e arquivos em produção
 const baseDir = process.env.NODE_ENV === 'production' ? '/tmp' : __dirname;
 
 if (!fs.existsSync(baseDir)) {
   fs.mkdirSync(baseDir, { recursive: true });
 }
 
-// Caminhos de persistência
+// Caminhos dos arquivos de persistência
 const dbPath = path.join(baseDir, 'database.db');
 const DATA_FILE = path.join(baseDir, 'devices.json');
 
-// 2. Inicialização do SQLite
+// 2. Inicialização do Banco de Dados SQLite
 let db;
+
 try {
   db = new Database(dbPath);
-  console.log('Banco de dados SQLite carregado em: ${dbPath}');
+  console.log(Banco de dados SQLite carregado em: ${dbPath});
 } catch (error) {
   console.error('Erro ao inicializar o banco SQLite:', error);
 }
 
-// 3. Funções auxiliares JSON
+// 3. Funções auxiliares para gerenciar o arquivo JSON secundário
 function loadDevices() {
   try {
     if (!fs.existsSync(DATA_FILE)) {
       fs.writeFileSync(DATA_FILE, JSON.stringify({}), 'utf8');
       return {};
     }
+
     const data = fs.readFileSync(DATA_FILE, 'utf8');
     return JSON.parse(data || '{}');
+
   } catch (err) {
     console.error('Erro ao carregar devices.json:', err);
     return {};
@@ -47,25 +51,31 @@ let devices = loadDevices();
 
 function saveDevices() {
   try {
-    fs.writeFileSync(DATA_FILE, JSON.stringify(devices, null, 2), 'utf8');
+    fs.writeFileSync(
+      DATA_FILE,
+      JSON.stringify(devices, null, 2),
+      'utf8'
+    );
   } catch (err) {
     console.error('Erro ao salvar devices.json:', err);
   }
 }
 
-// 4. Servidor Express e WebSockets
+// 4. Configuração do Servidor Express e WebSockets
 const app = express();
+
 app.use(cors());
 app.use(express.json());
 
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
+// Eventos de WebSocket
 wss.on('connection', (ws) => {
   console.log('Novo cliente WebSocket conectado.');
 
   ws.on('message', (message) => {
-    console.log('Mensagem recebida via WS: ${message}');
+    console.log(Mensagem recebida via WS: ${message});
   });
 
   ws.on('close', () => {
@@ -73,6 +83,7 @@ wss.on('connection', (ws) => {
   });
 });
 
+// Broadcast para enviar atualizações em tempo real a todos os clientes
 function broadcast(data) {
   wss.clients.forEach((client) => {
     if (client.readyState === WebSocket.OPEN) {
@@ -83,90 +94,92 @@ function broadcast(data) {
 
 // 5. Rotas da API REST
 
-// Rota de Health Check / Resumo do Painel (Resolve "Servidor indisponível")
-app.get('/api/status', (req, res) => {
-  res.json({ ok: true, status: 'online' });
-});
-
-app.get('/api/summary', (req, res) => {
-  const deviceList = Object.values(devices);
-  res.json({
-    ok: true,
-    clientsCount: 0,
-    equipmentsCount: deviceList.length,
-    onlineCount: deviceList.length,
-    alarmsCount: 0
-  });
-});
-
-// Dispositivos / Equipamentos
+// Lista de equipamentos — o app espera um ARRAY, não um objeto
 app.get('/api/devices', (req, res) => {
-  res.json({ ok: true, devices });
+  res.json(Object.values(devices));
 });
 
-app.get('/api/equipments', (req, res) => {
-  res.json({ ok: true, equipments: Object.values(devices) });
-});
+// Cadastro de novo equipamento
+app.post('/api/devices/register', (req, res) => {
+  const { id, name, client, location } = req.body;
 
-// Telemetria
-app.post('/api/telemetry', (req, res) => {
-  const { id, temperature, humidity } = req.body;
-
-  if (!id) {
-    return res.status(400).json({ ok: false, message: 'ID do dispositivo é obrigatório.' });
+  if (!id || !name) {
+    return res.status(400).json({
+      ok: false,
+      message: 'ID e nome do equipamento são obrigatórios.'
+    });
   }
-
-  const timestamp = new Date().toISOString();
 
   devices[id] = {
     id,
-    temperature,
-    humidity,
-    updatedAt: timestamp
+    name,
+    client: client || '',
+    location: location || '',
+    temperature: 0,
+    vibration: 0,
+    humidity: 0,
+    compressorOn: false,
+    online: false,
+    updatedAt: new Date().toISOString()
   };
-  saveDevices();
 
-  broadcast({ type: 'TELEMETRY_UPDATE', device: devices[id] });
+  saveDevices();
 
   res.json({ ok: true, device: devices[id] });
 });
 
-// Alarmes
-app.get('/api/alarms/:id', (req, res) => {
-  const { id } = req.params;
+// Telemetria enviada pelos dispositivos (ESP32 etc.)
+app.post('/api/telemetry', (req, res) => {
+  const { id, temperature, humidity, vibration, compressorOn } = req.body;
+
+  if (!id) {
+    return res.status(400).json({
+      ok: false,
+      message: 'ID do dispositivo é obrigatório.'
+    });
+  }
+
+  const timestamp = new Date().toISOString();
+
+  const existing = devices[id] || {
+    id,
+    name: id,
+    client: '',
+    location: ''
+  };
+
+  devices[id] = {
+    ...existing,
+    id,
+    temperature: temperature ?? existing.temperature ?? 0,
+    humidity: humidity ?? existing.humidity ?? 0,
+    vibration: vibration ?? existing.vibration ?? 0,
+    compressorOn: compressorOn ?? existing.compressorOn ?? false,
+    online: true,
+    updatedAt: timestamp
+  };
+
+  saveDevices();
+
+  // Dispara evento via WebSocket em tempo real
+  broadcast({
+    type: 'telemetry',
+    data: devices[id]
+  });
+
   res.json({
     ok: true,
-    deviceId: id,
-    alarms: []
+    device: devices[id]
   });
 });
 
-app.get('/api/alarms', (req, res) => {
-  res.json({
-    ok: true,
-    alarms: []
-  });
-});
-
-// Histórico
-app.get('/api/history/:id/summary', (req, res) => {
-  const { id } = req.params;
-  const { period } = req.query;
-
-  res.json({
-    ok: true,
-    deviceId: id,
-    period: period || '24h',
-    history: []
-  });
-});
-
-// Rota raiz
+// Rota padrão para verificação de status
 app.get('/', (req, res) => {
   res.send('API Eletro Mais em execução com sucesso!');
 });
 
-// 6. Arranque do Servidor
+// 6. Inicialização do Servidor
+// Escutando em 0.0.0.0 para aceitar conexões do proxy Railway
 server.listen(PORT, '0.0.0.0', () => {
-  console.log('Servidor rodando na porta ${PORT}');
+  console.log(Servidor rodando na porta ${PORT});
 });
