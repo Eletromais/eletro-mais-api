@@ -23,7 +23,7 @@ const DATA_FILE = path.join(baseDir, 'devices.json');
 let db;
 try {
   db = new Database(dbPath);
-  console.log('Banco de dados SQLite carregado em: ${dbPath}');
+  console.log(Banco de dados SQLite carregado em: ${dbPath});
 } catch (error) {
   console.error('Erro ao inicializar o banco SQLite:', error);
 }
@@ -65,7 +65,7 @@ wss.on('connection', (ws) => {
   console.log('Novo cliente WebSocket conectado.');
 
   ws.on('message', (message) => {
-    console.log('Mensagem recebida via WS: ${message}');
+    console.log(Mensagem recebida via WS: ${message});
   });
 
   ws.on('close', () => {
@@ -83,9 +83,29 @@ function broadcast(data) {
 
 // 5. Rotas da API REST
 
-// Dispositivos
+// Rota de Health Check / Resumo do Painel (Resolve "Servidor indisponível")
+app.get('/api/status', (req, res) => {
+  res.json({ ok: true, status: 'online' });
+});
+
+app.get('/api/summary', (req, res) => {
+  const deviceList = Object.values(devices);
+  res.json({
+    ok: true,
+    clientsCount: 0,
+    equipmentsCount: deviceList.length,
+    onlineCount: deviceList.length,
+    alarmsCount: 0
+  });
+});
+
+// Dispositivos / Equipamentos
 app.get('/api/devices', (req, res) => {
   res.json({ ok: true, devices });
+});
+
+app.get('/api/equipments', (req, res) => {
+  res.json({ ok: true, equipments: Object.values(devices) });
 });
 
 // Telemetria
@@ -111,7 +131,7 @@ app.post('/api/telemetry', (req, res) => {
   res.json({ ok: true, device: devices[id] });
 });
 
-// Alarmes (Resolve o erro /api/alarms/:id)
+// Alarmes
 app.get('/api/alarms/:id', (req, res) => {
   const { id } = req.params;
   res.json({
@@ -121,7 +141,14 @@ app.get('/api/alarms/:id', (req, res) => {
   });
 });
 
-// Histórico (Resolve o erro /api/history/:id/summary)
+app.get('/api/alarms', (req, res) => {
+  res.json({
+    ok: true,
+    alarms: []
+  });
+});
+
+// Histórico
 app.get('/api/history/:id/summary', (req, res) => {
   const { id } = req.params;
   const { period } = req.query;
@@ -134,12 +161,12 @@ app.get('/api/history/:id/summary', (req, res) => {
   });
 });
 
-// Status
+// Rota raiz
 app.get('/', (req, res) => {
   res.send('API Eletro Mais em execução com sucesso!');
 });
 
 // 6. Arranque do Servidor
 server.listen(PORT, '0.0.0.0', () => {
-  console.log('Servidor rodando na porta ${PORT}');
+  console.log(Servidor rodando na porta ${PORT});
 });
