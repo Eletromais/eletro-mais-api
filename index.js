@@ -181,5 +181,5 @@ app.get('/', (req, res) => {
 // 6. Inicialização do Servidor
 // Escutando em 0.0.0.0 para aceitar conexões do proxy Railway
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(Servidor rodando na porta ${PORT});
+  console.log('Servidor rodando na porta ${PORT}');
 });
