@@ -1,0 +1,13 @@
+{
+  "EM-CF-0001": {
+    "id": "EM-CF-0001",
+    "name": "Câmara fria 01",
+    "client": "cliente teste",
+    "location": "câmara/teste",
+    "temperature": -1.56,
+    "vibration": 0,
+    "humidity": 0,
+    "compressorOn": false,
+    "updatedAt": "2026-08-25T09:30:44.263Z"
+  }
+}
