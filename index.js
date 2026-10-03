@@ -267,7 +267,7 @@ app.post('/api/telemetry', (req, res) => {
 
 // Obter todos os alarmes
 app.get('/api/alarms', (req, res) => {
-  if (!db) return res.json({ ok: true, alarms: [] });
+  if (!db) return res.json([]);
 
   try {
     const alarms = db.prepare('SELECT * FROM alarms ORDER BY id DESC LIMIT 50').all();
