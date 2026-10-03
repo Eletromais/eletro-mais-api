@@ -25,7 +25,7 @@ let db;
 
 try {
   db = new Database(dbPath);
-  console.log(Banco de dados SQLite carregado em: ${dbPath});
+  console.log('Banco de dados SQLite carregado em: ${dbPath}');
 } catch (error) {
   console.error('Erro ao inicializar o banco SQLite:', error);
 }
