@@ -6,8 +6,26 @@ const http = require('http');
 const WebSocket = require('ws');
 const Database = require('better-sqlite3');
 const PDFDocument = require('pdfkit');
+const admin = require('firebase-admin');
 
 const PORT = process.env.PORT || 8080;
+
+// ---------- Firebase Admin (push notifications) ----------
+let firebaseReady = false;
+try {
+  if (process.env.FIREBASE_SERVICE_ACCOUNT) {
+    const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+    admin.initializeApp({
+      credential: admin.credential.cert(serviceAccount),
+    });
+    firebaseReady = true;
+    console.log('Firebase Admin inicializado com sucesso.');
+  } else {
+    console.warn('FIREBASE_SERVICE_ACCOUNT não definida — notificações push desativadas.');
+  }
+} catch (err) {
+  console.error('Erro ao inicializar Firebase Admin:', err);
+}
 
 const baseDir = process.env.NODE_ENV === 'production' ? '/tmp' : __dirname;
 if (!fs.existsSync(baseDir)) fs.mkdirSync(baseDir, { recursive: true });
@@ -19,7 +37,7 @@ const DATA_FILE = path.join(baseDir, 'devices.json');
 let db;
 try {
   db = new Database(dbPath);
-  console.log(`Banco de dados SQLite carregado em: ${dbPath}`);
+  console.log(Banco de dados SQLite carregado em: ${dbPath});
 } catch (error) {
   console.error('Erro ao inicializar o banco SQLite:', error);
 }
@@ -153,6 +171,54 @@ const activeAlarmStmt = db.prepare(`
   SELECT * FROM alarms WHERE deviceId = ? AND type = ? AND status = 'ACTIVE' LIMIT 1
 `);
 
+const ALARM_TITLES = {
+  TEMP_HIGH: 'Temperatura alta',
+  TEMP_LOW: 'Temperatura baixa',
+  COMM_OFFLINE: 'Perda de comunicação',
+  SENSOR_TEMP_FAIL: 'Falha no sensor de temperatura',
+};
+
+async function sendPushForAlarm(deviceId, type, value) {
+  if (!firebaseReady) return;
+
+  try {
+    const tokenRows = db.prepare(SELECT token, deviceIds FROM push_tokens).all();
+    const tokens = tokenRows
+      .filter((row) => {
+        try {
+          const ids = JSON.parse(row.deviceIds || '[]');
+          return ids.includes(deviceId);
+        } catch {
+          return false;
+        }
+      })
+      .map((row) => row.token);
+
+    if (!tokens.length) return;
+
+    const device = devices[deviceId];
+    const deviceName = device ? device.name : deviceId;
+    const title = ALARM_TITLES[type] || 'Alarme';
+    let body = ${deviceName};
+    if (type === 'TEMP_HIGH' || type === 'TEMP_LOW') {
+      body += ` - ${value.toFixed(1)} °C`;
+    } else {
+      body += ' - verifique o equipamento';
+    }
+
+    const message = {
+      notification: { title: ELETRO MAIS: ${title}, body },
+      data: { deviceId, alarmType: type },
+      tokens,
+    };
+
+    const result = await admin.messaging().sendEachForMulticast(message);
+    console.log(Push enviado: ${result.successCount} ok, ${result.failureCount} falhas.);
+  } catch (err) {
+    console.error('Erro ao enviar push:', err);
+  }
+}
+
 function openOrUpdateAlarm(deviceId, type, value, threshold) {
   const existing = activeAlarmStmt.get(deviceId, type);
   if (existing) {
@@ -168,6 +234,7 @@ function openOrUpdateAlarm(deviceId, type, value, threshold) {
     thresholdValue: threshold ?? null,
   });
   broadcast({ type: 'alarm', deviceId, alarmType: type });
+  sendPushForAlarm(deviceId, type, value);
 }
 
 function closeAlarmIfActive(deviceId, type, value) {
@@ -543,26 +610,26 @@ app.get('/api/reports/:id/pdf', (req, res) => {
   }
 
   res.setHeader('Content-Type', 'application/pdf');
-  res.setHeader('Content-Disposition', `attachment; filename="relatorio_${id}.pdf"`);
+  res.setHeader('Content-Disposition', attachment; filename="relatorio_${id}.pdf");
 
   const doc = new PDFDocument({ margin: 40 });
   doc.pipe(res);
 
   doc.fontSize(20).text('ELETRO MAIS - Relatório de Monitoramento', { align: 'center' });
   doc.moveDown();
-  doc.fontSize(12).text(`Equipamento: ${device.name} (${device.id})`);
-  doc.text(`Cliente: ${device.client || '-'}`);
-  doc.text(`Local: ${device.location || '-'}`);
-  doc.text(`Período: últimas ${hours} horas`);
-  doc.text(`Gerado em: ${new Date().toLocaleString('pt-BR')}`);
+  doc.fontSize(12).text(Equipamento: ${device.name} (${device.id}));
+  doc.text(Cliente: ${device.client || '-'});
+  doc.text(Local: ${device.location || '-'});
+  doc.text(Período: últimas ${hours} horas);
+  doc.text(Gerado em: ${new Date().toLocaleString('pt-BR')});
   doc.moveDown();
 
   doc.fontSize(14).text('Resumo de temperatura', { underline: true });
   doc.fontSize(12);
-  doc.text(`Mínima: ${minT !== null ? minT.toFixed(1) + ' °C' : '-'}`);
-  doc.text(`Média: ${avgT !== null ? avgT.toFixed(1) + ' °C' : '-'}`);
-  doc.text(`Máxima: ${maxT !== null ? maxT.toFixed(1) + ' °C' : '-'}`);
-  doc.text(`Total de registros: ${history.length}`);
+  doc.text(Mínima: ${minT !== null ? minT.toFixed(1) + ' °C' : '-'});
+  doc.text(Média: ${avgT !== null ? avgT.toFixed(1) + ' °C' : '-'});
+  doc.text(Máxima: ${maxT !== null ? maxT.toFixed(1) + ' °C' : '-'});
+  doc.text(Total de registros: ${history.length});
   doc.moveDown();
 
   doc.fontSize(14).text('Alarmes no período', { underline: true });
@@ -573,7 +640,7 @@ app.get('/api/reports/:id/pdf', (req, res) => {
     alarms.slice(0, 40).forEach((a) => {
       const start = new Date(a.startedAt).toLocaleString('pt-BR');
       const end = a.endedAt ? new Date(a.endedAt).toLocaleString('pt-BR') : 'em aberto';
-      doc.text(`${a.type} | início: ${start} | fim: ${end} | status: ${a.status}`);
+      doc.text(${a.type} | início: ${start} | fim: ${end} | status: ${a.status});
     });
   }
   doc.moveDown();
@@ -583,7 +650,7 @@ app.get('/api/reports/:id/pdf', (req, res) => {
   history.slice(-60).reverse().forEach((h) => {
     const when = new Date(h.createdAt).toLocaleString('pt-BR');
     doc.text(
-      `${when} - Temp: ${h.temperature.toFixed(1)}°C | Compressor: ${h.compressorOn ? 'LIGADO' : 'DESLIGADO'} | Degelo: ${h.defrostOn ? 'ATIVO' : 'DESLIGADO'}`
+      ${when} - Temp: ${h.temperature.toFixed(1)}°C | Compressor: ${h.compressorOn ? 'LIGADO' : 'DESLIGADO'} | Degelo: ${h.defrostOn ? 'ATIVO' : 'DESLIGADO'}
     );
   });
 
@@ -596,5 +663,5 @@ app.get('/', (req, res) => {
 });
 
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(`Servidor rodando na porta ${PORT}`);
+  console.log(Servidor rodando na porta ${PORT});
 });
