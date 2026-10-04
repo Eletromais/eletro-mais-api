@@ -182,7 +182,7 @@ async function sendPushForAlarm(deviceId, type, value) {
   if (!firebaseReady) return;
 
   try {
-    const tokenRows = db.prepare(SELECT token, deviceIds FROM push_tokens).all();
+    const tokenRows = db.prepare('SELECT token, deviceIds FROM push_tokens).all(');
     const tokens = tokenRows
       .filter((row) => {
         try {
