@@ -6,8 +6,26 @@ const http = require('http');
 const WebSocket = require('ws');
 const Database = require('better-sqlite3');
 const PDFDocument = require('pdfkit');
+const admin = require('firebase-admin');
 
 const PORT = process.env.PORT || 8080;
+
+// ---------- Firebase Admin (push notifications) ----------
+let firebaseReady = false;
+try {
+  if (process.env.FIREBASE_SERVICE_ACCOUNT) {
+    const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+    admin.initializeApp({
+      credential: admin.credential.cert(serviceAccount),
+    });
+    firebaseReady = true;
+    console.log('Firebase Admin inicializado com sucesso.');
+  } else {
+    console.warn('FIREBASE_SERVICE_ACCOUNT não definida — notificações push desativadas.');
+  }
+} catch (err) {
+  console.error('Erro ao inicializar Firebase Admin:', err);
+}
 
 const baseDir = process.env.NODE_ENV === 'production' ? '/tmp' : __dirname;
 if (!fs.existsSync(baseDir)) fs.mkdirSync(baseDir, { recursive: true });
@@ -153,6 +171,54 @@ const activeAlarmStmt = db.prepare(`
   SELECT * FROM alarms WHERE deviceId = ? AND type = ? AND status = 'ACTIVE' LIMIT 1
 `);
 
+const ALARM_TITLES = {
+  TEMP_HIGH: 'Temperatura alta',
+  TEMP_LOW: 'Temperatura baixa',
+  COMM_OFFLINE: 'Perda de comunicação',
+  SENSOR_TEMP_FAIL: 'Falha no sensor de temperatura',
+};
+
+async function sendPushForAlarm(deviceId, type, value) {
+  if (!firebaseReady) return;
+
+  try {
+    const tokenRows = db.prepare(`SELECT token, deviceIds FROM push_tokens`).all();
+    const tokens = tokenRows
+      .filter((row) => {
+        try {
+          const ids = JSON.parse(row.deviceIds || '[]');
+          return ids.includes(deviceId);
+        } catch {
+          return false;
+        }
+      })
+      .map((row) => row.token);
+
+    if (!tokens.length) return;
+
+    const device = devices[deviceId];
+    const deviceName = device ? device.name : deviceId;
+    const title = ALARM_TITLES[type] || 'Alarme';
+    let body = `${deviceName}`;
+    if (type === 'TEMP_HIGH' || type === 'TEMP_LOW') {
+      body += ` - ${value.toFixed(1)} °C`;
+    } else {
+      body += ' - verifique o equipamento';
+    }
+
+    const message = {
+      notification: { title: `ELETRO MAIS: ${title}`, body },
+      data: { deviceId, alarmType: type },
+      tokens,
+    };
+
+    const result = await admin.messaging().sendEachForMulticast(message);
+    console.log(`Push enviado: ${result.successCount} ok, ${result.failureCount} falhas.`);
+  } catch (err) {
+    console.error('Erro ao enviar push:', err);
+  }
+}
+
 function openOrUpdateAlarm(deviceId, type, value, threshold) {
   const existing = activeAlarmStmt.get(deviceId, type);
   if (existing) {
@@ -168,6 +234,7 @@ function openOrUpdateAlarm(deviceId, type, value, threshold) {
     thresholdValue: threshold ?? null,
   });
   broadcast({ type: 'alarm', deviceId, alarmType: type });
+  sendPushForAlarm(deviceId, type, value);
 }
 
 function closeAlarmIfActive(deviceId, type, value) {
