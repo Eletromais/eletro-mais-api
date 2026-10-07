@@ -19,6 +19,7 @@ if (!fs.existsSync(baseDir)) {
 
 const dbPath = path.join(baseDir, 'database.db');
 const DATA_FILE = path.join(baseDir, 'devices.json');
+const CLIENTS_FILE = path.join(baseDir, 'clients.json');
 const PUSH_TOKENS_FILE = path.join(baseDir, 'push_tokens.json');
 
 // 2. Inicialização do Firebase Admin SDK para envio de Push Notifications
@@ -36,7 +37,7 @@ try {
     });
     console.log('[FCM] Firebase Admin SDK inicializado via serviceAccountKey.json.');
   } else {
-    console.warn('[FCM] Nenhuma credencial do Firebase encontrada. As notificações Push ficarão desativadas até configurar o Firebase Admin.');
+    console.warn('[FCM] Nenhuma credencial do Firebase encontrada. As notificações Push ficarão desativadas.');
   }
 } catch (error) {
   console.error('[FCM] Erro ao inicializar o Firebase Admin SDK:', error);
@@ -47,6 +48,17 @@ let db;
 try {
   db = new Database(dbPath);
   console.log(`Banco de dados SQLite carregado em: ${dbPath}`);
+
+  // Tabela para guardar registros de clientes
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS clients (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL,
+      email TEXT,
+      phone TEXT,
+      createdAt TEXT NOT NULL
+    )
+  `);
 
   // Tabela para guardar registros de alarmes
   db.exec(`
@@ -81,7 +93,7 @@ try {
   console.error('Erro ao inicializar o banco SQLite:', error);
 }
 
-// 4. Gestão e Persistência de Dados (Equipamentos e Push Tokens)
+// 4. Gestão e Persistência de Dados
 function loadJSON(filePath) {
   try {
     if (!fs.existsSync(filePath)) {
@@ -105,7 +117,8 @@ function saveJSON(filePath, data) {
 }
 
 let devices = loadJSON(DATA_FILE);
-let pushTokens = loadJSON(PUSH_TOKENS_FILE); // { token: { platform: 'android', deviceIds: ['EM-CF-0001'] } }
+let clients = loadJSON(CLIENTS_FILE);
+let pushTokens = loadJSON(PUSH_TOKENS_FILE);
 
 // Envio de Push Notification via Firebase Messaging
 async function sendPushNotification(title, body, targetDeviceId) {
@@ -125,10 +138,7 @@ async function sendPushNotification(title, body, targetDeviceId) {
   }
 
   const message = {
-    notification: {
-      title,
-      body
-    },
+    notification: { title, body },
     data: {
       deviceId: targetDeviceId || '',
       click_action: 'FLUTTER_NOTIFICATION_CLICK'
@@ -138,7 +148,7 @@ async function sendPushNotification(title, body, targetDeviceId) {
 
   try {
     const response = await admin.messaging().sendEachForMulticast(message);
-    console.log(`[FCM] Notificação Push enviada com sucesso: ${response.successCount} entregues, ${response.failureCount} falhas.`);
+    console.log(`[FCM] Notificação Push enviada com sucesso: ${response.successCount} entregues.`);
   } catch (err) {
     console.error('[FCM] Erro ao disparar mensagem Multicast:', err);
   }
@@ -160,13 +170,11 @@ function triggerAlarm(deviceId, type, startValue, thresholdValue, title, message
         `);
         stmt.run(deviceId, type, timestamp, startValue, startValue, thresholdValue);
 
-        // Notifica via WebSocket (App Aberto)
         broadcast({
           type: 'alarm',
           data: { deviceId, type, status: 'ACTIVE', startedAt: timestamp }
         });
 
-        // Notifica via Push Notification (Barra do Telemóvel / Background)
         sendPushNotification(title, messageText, deviceId);
       }
     } catch (err) {
@@ -206,6 +214,7 @@ function broadcast(data) {
 // Dashboard / Resumo de status
 app.get('/api/summary', (req, res) => {
   const deviceList = Object.values(devices);
+  const clientList = Object.values(clients);
   let activeAlarmsCount = 0;
 
   if (db) {
@@ -219,40 +228,78 @@ app.get('/api/summary', (req, res) => {
 
   res.json({
     ok: true,
-    clientsCount: 1,
+    clientsCount: clientList.length,
     equipmentsCount: deviceList.length,
     onlineCount: deviceList.filter(d => d.online).length,
     alarmsCount: activeAlarmsCount
   });
 });
 
-// Retorna lista direta de equipamentos para o Flutter
+// --- ROTAS DE CLIENTES ---
+
+// Listar todos os clientes
+app.get('/api/clients', (req, res) => {
+  res.json(Object.values(clients));
+});
+
+// Cadastrar novo cliente
+app.post('/api/clients', (req, res) => {
+  const { name, email, phone } = req.body;
+
+  if (!name) {
+    return res.status(400).json({ ok: false, message: 'Nome do cliente é obrigatório.' });
+  }
+
+  const clientId = Date.now().toString();
+  const createdAt = new Date().toISOString();
+
+  const newClient = {
+    id: clientId,
+    name,
+    email: email || '',
+    phone: phone || '',
+    createdAt
+  };
+
+  clients[clientId] = newClient;
+  saveJSON(CLIENTS_FILE, clients);
+
+  if (db) {
+    try {
+      db.prepare(`
+        INSERT INTO clients (name, email, phone, createdAt)
+        VALUES (?, ?, ?, ?)
+      `).run(name, email || '', phone || '', createdAt);
+    } catch (err) {
+      console.error('Erro ao gravar cliente no SQLite:', err);
+    }
+  }
+
+  res.json({ ok: true, client: newClient });
+});
+
+// Excluir cliente
+app.delete('/api/clients/:id', (req, res) => {
+  const { id } = req.params;
+
+  if (!clients[id]) {
+    return res.status(404).json({ ok: false, message: 'Cliente não encontrado.' });
+  }
+
+  delete clients[id];
+  saveJSON(CLIENTS_FILE, clients);
+
+  res.json({ ok: true, message: 'Cliente excluído com sucesso.' });
+});
+
+// --- ROTAS DE EQUIPAMENTOS ---
+
+// Listar todos os equipamentos
 app.get('/api/devices', (req, res) => {
   res.json(Object.values(devices));
 });
 
-// Configurações de limites de alarme
-app.patch('/api/devices/:id/settings', (req, res) => {
-  const { id } = req.params;
-  const { tempMin, tempMax, alarmDelaySec, offlineDelaySec } = req.body;
-
-  if (!devices[id]) {
-    return res.status(404).json({ ok: false, message: 'Dispositivo não encontrado.' });
-  }
-
-  devices[id] = {
-    ...devices[id],
-    tempMin: tempMin !== undefined ? tempMin : devices[id].tempMin,
-    tempMax: tempMax !== undefined ? tempMax : devices[id].tempMax,
-    alarmDelaySec: alarmDelaySec !== undefined ? alarmDelaySec : devices[id].alarmDelaySec,
-    offlineDelaySec: offlineDelaySec !== undefined ? offlineDelaySec : devices[id].offlineDelaySec,
-  };
-
-  saveJSON(DATA_FILE, devices);
-  res.json({ ok: true, device: devices[id] });
-});
-
-// Cadastro de novo equipamento
+// Cadastrar novo equipamento
 app.post('/api/devices/register', (req, res) => {
   const { id, name, client, location } = req.body;
 
@@ -280,10 +327,68 @@ app.post('/api/devices/register', (req, res) => {
   };
 
   saveJSON(DATA_FILE, devices);
+
+  broadcast({
+    type: 'device_registered',
+    data: devices[id]
+  });
+
   res.json({ ok: true, device: devices[id] });
 });
 
-// Recepção de Telemetria (ESP32 etc.)
+// EXCLUIR EQUIPAMENTO
+app.delete('/api/devices/:id', (req, res) => {
+  const { id } = req.params;
+
+  if (!devices[id]) {
+    return res.status(404).json({ ok: false, message: 'Equipamento não encontrado.' });
+  }
+
+  delete devices[id];
+  saveJSON(DATA_FILE, devices);
+
+  // Remove histórico e alarmes associados no SQLite
+  if (db) {
+    try {
+      db.prepare('DELETE FROM alarms WHERE deviceId = ?').run(id);
+      db.prepare('DELETE FROM telemetry_history WHERE deviceId = ?').run(id);
+    } catch (err) {
+      console.error('Erro ao excluir histórico do equipamento no SQLite:', err);
+    }
+  }
+
+  // Notifica os apps em tempo real
+  broadcast({
+    type: 'device_deleted',
+    data: { id }
+  });
+
+  res.json({ ok: true, message: `Equipamento ${id} excluído com sucesso.` });
+});
+
+// Atualizar limites e configurações do equipamento
+app.patch('/api/devices/:id/settings', (req, res) => {
+  const { id } = req.params;
+  const { tempMin, tempMax, alarmDelaySec, offlineDelaySec } = req.body;
+
+  if (!devices[id]) {
+    return res.status(404).json({ ok: false, message: 'Dispositivo não encontrado.' });
+  }
+
+  devices[id] = {
+    ...devices[id],
+    tempMin: tempMin !== undefined ? tempMin : devices[id].tempMin,
+    tempMax: tempMax !== undefined ? tempMax : devices[id].tempMax,
+    alarmDelaySec: alarmDelaySec !== undefined ? alarmDelaySec : devices[id].alarmDelaySec,
+    offlineDelaySec: offlineDelaySec !== undefined ? offlineDelaySec : devices[id].offlineDelaySec,
+  };
+
+  saveJSON(DATA_FILE, devices);
+  res.json({ ok: true, device: devices[id] });
+});
+
+// --- TELEMETRIA E NOTIFICAÇÕES ---
+
 app.post('/api/telemetry', (req, res) => {
   const { id, temperature, humidity, vibration, compressorOn, defrostOn, sensorOk } = req.body;
 
@@ -310,7 +415,6 @@ app.post('/api/telemetry', (req, res) => {
   devices[id] = updatedDevice;
   saveJSON(DATA_FILE, devices);
 
-  // Registro no Histórico do SQLite
   if (db) {
     try {
       db.prepare(`
@@ -322,4 +426,151 @@ app.post('/api/telemetry', (req, res) => {
         updatedDevice.vibration,
         updatedDevice.humidity,
         updatedDevice.compressorOn ? 1 : 0,
-        updatedDevice.defrostOn
+        updatedDevice.defrostOn ? 1 : 0,
+        timestamp
+      );
+    } catch (e) {
+      console.error('Erro ao gravar histórico no SQLite:', e);
+    }
+  }
+
+  if (updatedDevice.tempMax !== null && updatedDevice.temperature > updatedDevice.tempMax) {
+    triggerAlarm(
+      id,
+      'TEMP_HIGH',
+      updatedDevice.temperature,
+      updatedDevice.tempMax,
+      'Alarme: Temperatura Alta!',
+      `O equipamento ${existing.name || id} atingiu ${updatedDevice.temperature}°C (Limite: ${updatedDevice.tempMax}°C)`
+    );
+  }
+
+  if (updatedDevice.tempMin !== null && updatedDevice.temperature < updatedDevice.tempMin) {
+    triggerAlarm(
+      id,
+      'TEMP_LOW',
+      updatedDevice.temperature,
+      updatedDevice.tempMin,
+      'Alarme: Temperatura Baixa!',
+      `O equipamento ${existing.name || id} atingiu ${updatedDevice.temperature}°C (Limite: ${updatedDevice.tempMin}°C)`
+    );
+  }
+
+  broadcast({
+    type: 'telemetry',
+    data: updatedDevice
+  });
+
+  res.json({ ok: true, device: updatedDevice });
+});
+
+// Registro de Tokens Push FCM
+app.post('/api/push/register', (req, res) => {
+  const { token, platform, deviceIds } = req.body;
+
+  if (!token) {
+    return res.status(400).json({ ok: false, message: 'Token de notificação não fornecido.' });
+  }
+
+  pushTokens[token] = {
+    platform: platform || 'android',
+    deviceIds: deviceIds || [],
+    updatedAt: new Date().toISOString()
+  };
+
+  saveJSON(PUSH_TOKENS_FILE, pushTokens);
+  res.json({ ok: true, message: 'Token registrado com sucesso.' });
+});
+
+// --- CONSULTAS E HISTÓRICOS ---
+
+app.get('/api/alarms/:id', (req, res) => {
+  const { id } = req.params;
+  const { status } = req.query;
+
+  if (!db) return res.json([]);
+
+  try {
+    let query = 'SELECT * FROM alarms WHERE deviceId = ?';
+    const params = [id];
+
+    if (status && status !== 'all') {
+      query += ' AND status = ?';
+      params.push(status.toUpperCase());
+    }
+
+    query += ' ORDER BY id DESC LIMIT 500';
+    const alarms = db.prepare(query).all(...params);
+    res.json(alarms);
+  } catch (err) {
+    console.error('Erro ao procurar alarmes:', err);
+    res.status(500).json({ ok: false, message: 'Erro ao buscar alarmes.' });
+  }
+});
+
+app.get('/api/history/:id/summary', (req, res) => {
+  const { id } = req.params;
+  const hours = parseInt(req.query.hours || '24', 10);
+
+  if (!db) {
+    return res.json({
+      deviceId: id,
+      hours,
+      bucketMinutes: 5,
+      stats: { totalRecords: 0, minTemperature: null, avgTemperature: null, maxTemperature: null, firstAt: null, lastAt: null },
+      series: [],
+      recent: []
+    });
+  }
+
+  try {
+    const recent = db.prepare('SELECT * FROM telemetry_history WHERE deviceId = ? ORDER BY id DESC LIMIT 100').all(id);
+    const statsRow = db.prepare(`
+      SELECT 
+        COUNT(*) as totalRecords,
+        MIN(temperature) as minTemperature,
+        AVG(temperature) as avgTemperature,
+        MAX(temperature) as maxTemperature,
+        MIN(createdAt) as firstAt,
+        MAX(createdAt) as lastAt
+      FROM telemetry_history WHERE deviceId = ?
+    `).get(id);
+
+    res.json({
+      deviceId: id,
+      hours,
+      bucketMinutes: 5,
+      stats: statsRow || { totalRecords: 0, minTemperature: null, avgTemperature: null, maxTemperature: null, firstAt: null, lastAt: null },
+      series: [],
+      recent
+    });
+  } catch (e) {
+    console.error('Erro ao compor histórico:', e);
+    res.status(500).json({ ok: false, message: 'Erro ao gerar histórico.' });
+  }
+});
+
+app.get('/api/operations/:id/summary', (req, res) => {
+  const { id } = req.params;
+  const hours = parseInt(req.query.hours || '24', 10);
+
+  res.json({
+    deviceId: id,
+    hours,
+    compressor: { cycles: 0, totalSec: 0, avgSec: 0, maxSec: 0, active: false, activeSince: null, activeSec: 0 },
+    defrost: { cycles: 0, totalSec: 0, avgSec: 0, maxSec: 0, active: false, activeSince: null, activeSec: 0 }
+  });
+});
+
+app.get('/api/operations/:id', (req, res) => {
+  res.json([]);
+});
+
+app.get('/', (req, res) => {
+  res.send('API Eletro Mais em execução com sucesso!');
+});
+
+// 7. Arranque do Servidor
+server.listen(PORT, '0.0.0.0', () => {
+  console.log(`Servidor rodando na porta ${PORT}`);
+});
