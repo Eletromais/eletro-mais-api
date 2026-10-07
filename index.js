@@ -5,7 +5,9 @@ const path = require('path');
 const http = require('http');
 const WebSocket = require('ws');
 const Database = require('better-sqlite3');
+const admin = require('firebase-admin');
 
+// A Railway injeta process.env.PORT. Fallback para 8080.
 const PORT = process.env.PORT || 8080;
 
 // 1. Definição do diretório seguro para produção e desenvolvimento
@@ -17,8 +19,30 @@ if (!fs.existsSync(baseDir)) {
 
 const dbPath = path.join(baseDir, 'database.db');
 const DATA_FILE = path.join(baseDir, 'devices.json');
+const PUSH_TOKENS_FILE = path.join(baseDir, 'push_tokens.json');
 
-// 2. Inicialização do SQLite e tabelas
+// 2. Inicialização do Firebase Admin SDK para envio de Push Notifications
+try {
+  if (process.env.FIREBASE_SERVICE_ACCOUNT) {
+    const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+    admin.initializeApp({
+      credential: admin.credential.cert(serviceAccount)
+    });
+    console.log('[FCM] Firebase Admin SDK inicializado via Variável de Ambiente.');
+  } else if (fs.existsSync(path.join(__dirname, 'serviceAccountKey.json'))) {
+    const serviceAccount = require('./serviceAccountKey.json');
+    admin.initializeApp({
+      credential: admin.credential.cert(serviceAccount)
+    });
+    console.log('[FCM] Firebase Admin SDK inicializado via serviceAccountKey.json.');
+  } else {
+    console.warn('[FCM] Nenhuma credencial do Firebase encontrada. As notificações Push ficarão desativadas até configurar o Firebase Admin.');
+  }
+} catch (error) {
+  console.error('[FCM] Erro ao inicializar o Firebase Admin SDK:', error);
+}
+
+// 3. Inicialização do SQLite e tabelas
 let db;
 try {
   db = new Database(dbPath);
@@ -57,37 +81,74 @@ try {
   console.error('Erro ao inicializar o banco SQLite:', error);
 }
 
-// 3. Funções auxiliares para persistência em JSON
-function loadDevices() {
+// 4. Gestão e Persistência de Dados (Equipamentos e Push Tokens)
+function loadJSON(filePath) {
   try {
-    if (!fs.existsSync(DATA_FILE)) {
-      fs.writeFileSync(DATA_FILE, JSON.stringify({}), 'utf8');
+    if (!fs.existsSync(filePath)) {
+      fs.writeFileSync(filePath, JSON.stringify({}), 'utf8');
       return {};
     }
-    const data = fs.readFileSync(DATA_FILE, 'utf8');
+    const data = fs.readFileSync(filePath, 'utf8');
     return JSON.parse(data || '{}');
   } catch (err) {
-    console.error('Erro ao carregar devices.json:', err);
+    console.error(`Erro ao carregar ${filePath}:`, err);
     return {};
   }
 }
 
-let devices = loadDevices();
-
-function saveDevices() {
+function saveJSON(filePath, data) {
   try {
-    fs.writeFileSync(DATA_FILE, JSON.stringify(devices, null, 2), 'utf8');
+    fs.writeFileSync(filePath, JSON.stringify(data, null, 2), 'utf8');
   } catch (err) {
-    console.error('Erro ao salvar devices.json:', err);
+    console.error(`Erro ao salvar ${filePath}:`, err);
   }
 }
 
-// Helper para emitir alarmes
-function triggerAlarm(deviceId, type, startValue, thresholdValue) {
+let devices = loadJSON(DATA_FILE);
+let pushTokens = loadJSON(PUSH_TOKENS_FILE); // { token: { platform: 'android', deviceIds: ['EM-CF-0001'] } }
+
+// Envio de Push Notification via Firebase Messaging
+async function sendPushNotification(title, body, targetDeviceId) {
+  if (!admin.apps.length) return;
+
+  const recipientTokens = [];
+
+  for (const [token, data] of Object.entries(pushTokens)) {
+    if (!data.deviceIds || data.deviceIds.length === 0 || data.deviceIds.includes(targetDeviceId)) {
+      recipientTokens.push(token);
+    }
+  }
+
+  if (recipientTokens.length === 0) {
+    console.log(`[FCM] Nenhum token registrado para o dispositivo: ${targetDeviceId}`);
+    return;
+  }
+
+  const message = {
+    notification: {
+      title,
+      body
+    },
+    data: {
+      deviceId: targetDeviceId || '',
+      click_action: 'FLUTTER_NOTIFICATION_CLICK'
+    },
+    tokens: recipientTokens
+  };
+
+  try {
+    const response = await admin.messaging().sendEachForMulticast(message);
+    console.log(`[FCM] Notificação Push enviada com sucesso: ${response.successCount} entregues, ${response.failureCount} falhas.`);
+  } catch (err) {
+    console.error('[FCM] Erro ao disparar mensagem Multicast:', err);
+  }
+}
+
+// Emissão e Notificação de Alarmes
+function triggerAlarm(deviceId, type, startValue, thresholdValue, title, messageText) {
   const timestamp = new Date().toISOString();
   if (db) {
     try {
-      // Verifica se já existe um alarme ativo do mesmo tipo para não duplicar
       const active = db.prepare(
         'SELECT * FROM alarms WHERE deviceId = ? AND type = ? AND status = "ACTIVE"'
       ).get(deviceId, type);
@@ -99,18 +160,22 @@ function triggerAlarm(deviceId, type, startValue, thresholdValue) {
         `);
         stmt.run(deviceId, type, timestamp, startValue, startValue, thresholdValue);
 
+        // Notifica via WebSocket (App Aberto)
         broadcast({
           type: 'alarm',
           data: { deviceId, type, status: 'ACTIVE', startedAt: timestamp }
         });
+
+        // Notifica via Push Notification (Barra do Telemóvel / Background)
+        sendPushNotification(title, messageText, deviceId);
       }
     } catch (err) {
-      console.error('Erro ao gerar alarme:', err);
+      console.error('Erro ao processar alarme:', err);
     }
   }
 }
 
-// 4. Servidor Express e WebSockets
+// 5. Servidor Express e WebSockets
 const app = express();
 app.use(cors());
 app.use(express.json());
@@ -136,14 +201,37 @@ function broadcast(data) {
   });
 }
 
-// 5. Rotas da API REST
+// 6. Rotas da API REST
 
-// Retorna lista direta de equipamentos (O Flutter aguarda um Array)
+// Dashboard / Resumo de status
+app.get('/api/summary', (req, res) => {
+  const deviceList = Object.values(devices);
+  let activeAlarmsCount = 0;
+
+  if (db) {
+    try {
+      const row = db.prepare('SELECT COUNT(*) as count FROM alarms WHERE status = "ACTIVE"').get();
+      activeAlarmsCount = row ? row.count : 0;
+    } catch (e) {
+      console.error('Erro ao ler resumo de alarmes:', e);
+    }
+  }
+
+  res.json({
+    ok: true,
+    clientsCount: 1,
+    equipmentsCount: deviceList.length,
+    onlineCount: deviceList.filter(d => d.online).length,
+    alarmsCount: activeAlarmsCount
+  });
+});
+
+// Retorna lista direta de equipamentos para o Flutter
 app.get('/api/devices', (req, res) => {
   res.json(Object.values(devices));
 });
 
-// Atualiza configurações de alarme do equipamento
+// Configurações de limites de alarme
 app.patch('/api/devices/:id/settings', (req, res) => {
   const { id } = req.params;
   const { tempMin, tempMax, alarmDelaySec, offlineDelaySec } = req.body;
@@ -160,16 +248,16 @@ app.patch('/api/devices/:id/settings', (req, res) => {
     offlineDelaySec: offlineDelaySec !== undefined ? offlineDelaySec : devices[id].offlineDelaySec,
   };
 
-  saveDevices();
+  saveJSON(DATA_FILE, devices);
   res.json({ ok: true, device: devices[id] });
 });
 
-// Registra novo equipamento
+// Cadastro de novo equipamento
 app.post('/api/devices/register', (req, res) => {
   const { id, name, client, location } = req.body;
 
   if (!id || !name) {
-    return res.status(400).json({ ok: false, message: 'ID e nome são obrigatórios.' });
+    return res.status(400).json({ ok: false, message: 'ID e nome do equipamento são obrigatórios.' });
   }
 
   devices[id] = {
@@ -191,16 +279,16 @@ app.post('/api/devices/register', (req, res) => {
     offlineDelaySec: 120
   };
 
-  saveDevices();
+  saveJSON(DATA_FILE, devices);
   res.json({ ok: true, device: devices[id] });
 });
 
-// Recebe telemetria do dispositivo
+// Recepção de Telemetria (ESP32 etc.)
 app.post('/api/telemetry', (req, res) => {
   const { id, temperature, humidity, vibration, compressorOn, defrostOn, sensorOk } = req.body;
 
   if (!id) {
-    return res.status(400).json({ ok: false, message: 'ID é obrigatório.' });
+    return res.status(400).json({ ok: false, message: 'ID do dispositivo é obrigatório.' });
   }
 
   const timestamp = new Date().toISOString();
@@ -220,9 +308,9 @@ app.post('/api/telemetry', (req, res) => {
   };
 
   devices[id] = updatedDevice;
-  saveDevices();
+  saveJSON(DATA_FILE, devices);
 
-  // Salva no histórico do SQLite
+  // Registro no Histórico do SQLite
   if (db) {
     try {
       db.prepare(`
@@ -234,129 +322,4 @@ app.post('/api/telemetry', (req, res) => {
         updatedDevice.vibration,
         updatedDevice.humidity,
         updatedDevice.compressorOn ? 1 : 0,
-        updatedDevice.defrostOn ? 1 : 0,
-        timestamp
-      );
-    } catch (e) {
-      console.error('Erro ao gravar histórico no SQLite:', e);
-    }
-  }
-
-  // Regras de Alarmes
-  if (updatedDevice.tempMax !== null && updatedDevice.temperature > updatedDevice.tempMax) {
-    triggerAlarm(id, 'TEMP_HIGH', updatedDevice.temperature, updatedDevice.tempMax);
-  }
-  if (updatedDevice.tempMin !== null && updatedDevice.temperature < updatedDevice.tempMin) {
-    triggerAlarm(id, 'TEMP_LOW', updatedDevice.temperature, updatedDevice.tempMin);
-  }
-
-  // Notifica clientes em tempo real via WS
-  broadcast({
-    type: 'telemetry',
-    data: updatedDevice
-  });
-
-  res.json({ ok: true, device: updatedDevice });
-});
-
-// Registra token FCM para Notificações Push
-app.post('/api/push/register', (req, res) => {
-  const { token, platform, deviceIds } = req.body;
-  console.log(`Token FCM registrado para platform [${platform}]: ${token}`);
-  res.json({ ok: true, message: 'Token registrado com sucesso.' });
-});
-
-// Rota de alarmes para um dispositivo específico
-app.get('/api/alarms/:id', (req, res) => {
-  const { id } = req.params;
-  const { status } = req.query;
-
-  if (!db) return res.json([]);
-
-  try {
-    let query = 'SELECT * FROM alarms WHERE deviceId = ?';
-    const params = [id];
-
-    if (status && status !== 'all') {
-      query += ' AND status = ?';
-      params.push(status.toUpperCase());
-    }
-
-    query += ' ORDER BY id DESC LIMIT 500';
-    const alarms = db.prepare(query).all(...params);
-    res.json(alarms);
-  } catch (err) {
-    console.error('Erro ao buscar alarmes:', err);
-    res.status(500).json({ ok: false, message: 'Erro ao buscar alarmes.' });
-  }
-});
-
-// Resumo do Histórico para os Gráficos no Flutter
-app.get('/api/history/:id/summary', (req, res) => {
-  const { id } = req.params;
-  const hours = parseInt(req.query.hours || '24', 10);
-
-  if (!db) {
-    return res.json({
-      deviceId: id,
-      hours,
-      bucketMinutes: 5,
-      stats: { totalRecords: 0, minTemperature: null, avgTemperature: null, maxTemperature: null, firstAt: null, lastAt: null },
-      series: [],
-      recent: []
-    });
-  }
-
-  try {
-    const recent = db.prepare('SELECT * FROM telemetry_history WHERE deviceId = ? ORDER BY id DESC LIMIT 100').all(id);
-    const statsRow = db.prepare(`
-      SELECT 
-        COUNT(*) as totalRecords,
-        MIN(temperature) as minTemperature,
-        AVG(temperature) as avgTemperature,
-        MAX(temperature) as maxTemperature,
-        MIN(createdAt) as firstAt,
-        MAX(createdAt) as lastAt
-      FROM telemetry_history WHERE deviceId = ?
-    `).get(id);
-
-    res.json({
-      deviceId: id,
-      hours,
-      bucketMinutes: 5,
-      stats: statsRow || { totalRecords: 0, minTemperature: null, avgTemperature: null, maxTemperature: null, firstAt: null, lastAt: null },
-      series: [],
-      recent
-    });
-  } catch (e) {
-    console.error('Erro ao compor histórico:', e);
-    res.status(500).json({ ok: false, message: 'Erro ao gerar histórico.' });
-  }
-});
-
-// Operações / Ciclos de Compressor e Degelo
-app.get('/api/operations/:id/summary', (req, res) => {
-  const { id } = req.params;
-  const hours = parseInt(req.query.hours || '24', 10);
-
-  res.json({
-    deviceId: id,
-    hours,
-    compressor: { cycles: 0, totalSec: 0, avgSec: 0, maxSec: 0, active: false, activeSince: null, activeSec: 0 },
-    defrost: { cycles: 0, totalSec: 0, avgSec: 0, maxSec: 0, active: false, activeSince: null, activeSec: 0 }
-  });
-});
-
-app.get('/api/operations/:id', (req, res) => {
-  res.json([]);
-});
-
-// Rota raiz
-app.get('/', (req, res) => {
-  res.send('API Eletro Mais em execução com sucesso!');
-});
-
-// 6. Arranque do Servidor
-server.listen(PORT, '0.0.0.0', () => {
-  console.log(`Servidor rodando na porta ${PORT}`);
-});
+        updatedDevice.defrostOn
