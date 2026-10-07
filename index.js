@@ -27,7 +27,9 @@ try {
   console.error('Erro ao inicializar Firebase Admin:', err);
 }
 
-const baseDir = process.env.NODE_ENV === 'production' ? '/tmp' : __dirname;
+// DATA_DIR deve apontar para um Volume da Railway (ex.: /data) para os dados
+// sobreviverem a deploys. Sem ele, usa a pasta do projeto.
+const baseDir = process.env.DATA_DIR || __dirname;
 if (!fs.existsSync(baseDir)) fs.mkdirSync(baseDir, { recursive: true });
 
 const dbPath = path.join(baseDir, 'database.db');
@@ -82,6 +84,18 @@ db.exec(`
     platform TEXT,
     deviceIds TEXT,
     updatedAt TEXT
+  );
+
+  CREATE TABLE IF NOT EXISTS clients (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    contact TEXT,
+    createdAt TEXT NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS deleted_devices (
+    deviceId TEXT PRIMARY KEY,
+    deletedAt TEXT NOT NULL
   );
 
   CREATE INDEX IF NOT EXISTS idx_history_device ON history(deviceId, createdAt);
@@ -306,6 +320,10 @@ app.post('/api/devices/register', (req, res) => {
   if (!id || !name) {
     return res.status(400).json({ ok: false, message: 'ID e nome são obrigatórios.' });
   }
+
+  // se o ID tinha sido excluído antes, libera para voltar a receber telemetria
+  db.prepare(`DELETE FROM deleted_devices WHERE deviceId = ?`).run(id);
+
   devices[id] = defaultDevice(id, { name, client, location });
   saveDevices();
   res.json({ ok: true, device: devices[id] });
@@ -328,6 +346,92 @@ app.patch('/api/devices/:id/settings', (req, res) => {
   res.json({ ok: true, device: devices[id] });
 });
 
+// ---------- Excluir equipamento ----------
+const deleteEquipmentTx = db.transaction((id) => {
+  db.prepare(`DELETE FROM history WHERE deviceId = ?`).run(id);
+  db.prepare(`DELETE FROM operations WHERE deviceId = ?`).run(id);
+  db.prepare(`DELETE FROM alarms WHERE deviceId = ?`).run(id);
+
+  // remove o equipamento da lista de cada celular registrado para push
+  const rows = db.prepare(`SELECT token, deviceIds FROM push_tokens`).all();
+  const update = db.prepare(`UPDATE push_tokens SET deviceIds = ? WHERE token = ?`);
+  for (const row of rows) {
+    try {
+      const ids = JSON.parse(row.deviceIds || '[]');
+      if (ids.includes(id)) {
+        update.run(JSON.stringify(ids.filter((x) => x !== id)), row.token);
+      }
+    } catch {}
+  }
+
+  db.prepare(`
+    INSERT OR REPLACE INTO deleted_devices (deviceId, deletedAt) VALUES (?, ?)
+  `).run(id, new Date().toISOString());
+});
+
+app.delete('/api/devices/:id', (req, res) => {
+  const { id } = req.params;
+
+  if (!devices[id]) {
+    return res.status(404).json({ ok: false, message: 'Dispositivo não encontrado.' });
+  }
+
+  try {
+    deleteEquipmentTx(id);
+    delete devices[id];
+    saveDevices();
+    broadcast({ type: 'device_deleted', deviceId: id });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('Erro ao excluir equipamento:', err);
+    res.status(500).json({ ok: false, message: 'Erro ao excluir equipamento.' });
+  }
+});
+
+// ---------- Clientes ----------
+const insertClientStmt = db.prepare(`
+  INSERT INTO clients (name, contact, createdAt) VALUES (?, ?, ?)
+`);
+
+app.get('/api/clients', (req, res) => {
+  const rows = db.prepare(`SELECT name, contact FROM clients`).all();
+  const map = new Map(rows.map((r) => [r.name.toLowerCase(), r]));
+
+  // inclui clientes que já existem só como texto nos equipamentos
+  for (const d of Object.values(devices)) {
+    const name = (d.client || '').trim();
+    if (name && !map.has(name.toLowerCase())) {
+      map.set(name.toLowerCase(), { name, contact: '' });
+    }
+  }
+
+  const list = Array.from(map.values()).sort((a, b) =>
+    a.name.localeCompare(b.name, 'pt-BR')
+  );
+  res.json(list);
+});
+
+app.post('/api/clients', (req, res) => {
+  const name = (req.body.name || '').trim();
+  const contact = (req.body.contact || '').trim();
+
+  if (!name) {
+    return res.status(400).json({ ok: false, message: 'Nome do cliente é obrigatório.' });
+  }
+
+  try {
+    insertClientStmt.run(name, contact, new Date().toISOString());
+    res.json({ ok: true });
+  } catch (err) {
+    if (String(err.message).includes('UNIQUE')) {
+      return res.status(409).json({ ok: false, message: 'Cliente já cadastrado.' });
+    }
+    console.error('Erro ao cadastrar cliente:', err);
+    res.status(500).json({ ok: false, message: 'Erro ao cadastrar cliente.' });
+  }
+});
+
+// ---------- Telemetria ----------
 app.post('/api/telemetry', (req, res) => {
   const {
     id, temperature, humidity, vibration,
@@ -336,6 +440,12 @@ app.post('/api/telemetry', (req, res) => {
 
   if (!id) {
     return res.status(400).json({ ok: false, message: 'ID do dispositivo é obrigatório.' });
+  }
+
+  // equipamento excluído não deve ser recriado automaticamente
+  const blocked = db.prepare(`SELECT 1 FROM deleted_devices WHERE deviceId = ?`).get(id);
+  if (blocked) {
+    return res.status(410).json({ ok: false, message: 'Equipamento excluído.' });
   }
 
   const timestamp = new Date().toISOString();
